@@ -96,16 +96,21 @@ type PIterator struct {
 	uidPosting *protos.Posting
 	uidx       int // index of UIDs
 	pidx       int // index of postings
+	uidLen     int
 	ulen       int
 	plen       int
 	valid      bool
 }
 
 func findUidIndex(pl *protos.PostingList, afterUid uint64) int {
-	ulen := len(pl.Uids) / 8
+	if len(pl.Uids) == 0 {
+		return 0
+	}
+	uidLen := int(pl.Uids[0])
+	ulen := (len(pl.Uids) - 1) / uidLen
 	return sort.Search(ulen, func(idx int) bool {
-		i := idx * 8
-		uid := binary.BigEndian.Uint64(pl.Uids[i : i+8])
+		i := 1 + idx*uidLen
+		uid := x.Uint64(uidLen, pl.Uids[i:i+uidLen])
 		return afterUid < uid
 	})
 }
@@ -113,7 +118,10 @@ func findUidIndex(pl *protos.PostingList, afterUid uint64) int {
 func (it *PIterator) Init(pl *protos.PostingList, afterUid uint64) {
 	it.pl = pl
 	it.uidPosting = &protos.Posting{}
-	it.ulen = len(pl.Uids) / 8
+	if len(pl.Uids) > 0 {
+		it.uidLen = int(pl.Uids[0])
+		it.ulen = (len(pl.Uids) - 1) / it.uidLen
+	}
 	it.plen = len(pl.Postings)
 	it.uidx = findUidIndex(pl, afterUid)
 	it.pidx = sort.Search(it.plen, func(idx int) bool {
@@ -137,8 +145,8 @@ func (it *PIterator) Valid() bool {
 }
 
 func (it *PIterator) Posting() *protos.Posting {
-	i := it.uidx * 8
-	uid := binary.BigEndian.Uint64(it.pl.Uids[i : i+8])
+	i := 1 + it.uidx*it.uidLen
+	uid := x.Uint64(it.uidLen, it.pl.Uids[i:i+it.uidLen])
 
 	for it.pidx < it.plen {
 		if it.pl.Postings[it.pidx].Uid > uid {
@@ -597,7 +605,11 @@ func (l *List) length(afterUid uint64) int {
 		})
 	}
 
-	count := len(l.plist.Uids)/8 - uidx
+	var count int
+	if len(l.plist.Uids) > 0 {
+		uidLen := int(l.plist.Uids[0])
+		count = (len(l.plist.Uids)-1)/uidLen - uidx
+	}
 	for _, p := range l.mlayer[midx:] {
 		if p.Op == Add {
 			count++
@@ -644,10 +656,30 @@ func (l *List) syncIfDirty(delFromCache bool) (committed bool, err error) {
 
 	final := new(protos.PostingList)
 	numUids := l.length(0)
-	if cap(final.Uids) < 8*numUids {
-		final.Uids = make([]byte, 8*numUids)
+	var maxUid uint64
+	var uidLen int
+	if len(l.plist.Uids) > 0 {
+		uidLen = int(l.plist.Uids[0])
+		maxUid = x.Uint64(uidLen, l.plist.Uids[len(l.plist.Uids)-uidLen:])
 	}
-	final.Uids = final.Uids[:8*numUids]
+	if len(l.mlayer) > 0 && l.mlayer[len(l.mlayer)-1].Uid > maxUid {
+		maxUid = l.mlayer[len(l.mlayer)-1].Uid
+	}
+	uidLen = x.BytesForEncoding(maxUid)
+	
+	var numBytes int
+	if numUids > 0 {
+	numBytes = 1 + uidLen*numUids
+} else {
+	numBytes = 0
+}
+	if cap(final.Uids) < numBytes {
+		final.Uids = make([]byte, numBytes)
+	}
+	final.Uids = final.Uids[:numBytes]
+	if numBytes > 0 {
+	final.Uids[0] = byte(uidLen)
+}
 
 	var ubuf [16]byte
 	h := md5.New()
@@ -661,9 +693,9 @@ func (l *List) syncIfDirty(delFromCache bool) (committed bool, err error) {
 		h.Write(p.Value)
 		h.Write([]byte(p.Label))
 
-		i := 8 * count
-		binary.BigEndian.PutUint64(final.Uids[i:i+8], p.Uid)
-		count++
+		i := 1 + uidLen*count
+			x.PutUint64(uidLen, final.Uids[i:i+uidLen], p.Uid)
+	count++
 
 		if p.Facets != nil || p.Value != nil || len(p.Metadata) != 0 || len(p.Label) != 0 {
 			// I think it's okay to take the pointer from the iterator, because we have a lock
